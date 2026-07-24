@@ -28,31 +28,33 @@ jobs:
         run: dotnet test HackatonFiap.Notifications.sln --configuration Release --no-build --verbosity minimal
 
   cd:
-    name: Deploy
+    name: Deploy to Azure Functions (opcional)
     runs-on: ubuntu-latest
     needs: ci
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Gated: só roda em push na main COM a variável DEPLOY_ENABLED=true.
+    # Assim a CI (build+test) permanece verde sem os secrets Azure (RT5) — antes
+    # a CD rodava sempre e quebrava no Azure Login por falta de AZURE_CREDENTIALS.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
 
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Login to ACR
-        run: az acr login --name ${{ secrets.ACR_NAME }}
+      # Este serviço é uma Azure Function (.NET 8 isolated), NÃO um container/AKS/ACA.
+      # Publica direto na Function App gerenciada via azure/functions-action.
+      - name: Publish Function
+        run: dotnet publish src/HackatonFiap.Notifications/HackatonFiap.Notifications.csproj -c Release -o ./output
 
-      - name: Build and push Docker image
-        run: |
-          IMAGE=${{ secrets.ACR_NAME }}.azurecr.io/hackaton-fiap-notifications
-          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest -f src/HackatonFiap.Notifications/Dockerfile .
-          docker push $IMAGE:${{ github.sha }}
-          docker push $IMAGE:latest
-
-      - name: Deploy to Azure Container App
-        run: |
-          az containerapp update \
-            --name ${{ secrets.CONTAINER_APP_NAME }} \
-            --resource-group ${{ secrets.RESOURCE_GROUP }} \
-            --image ${{ secrets.ACR_NAME }}.azurecr.io/hackaton-fiap-notifications:${{ github.sha }}
+      - name: Deploy to Azure Functions
+        uses: Azure/functions-action@v1
+        with:
+          app-name: func-conexao-notifications-7xafxr
+          package: ./output
