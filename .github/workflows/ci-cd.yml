@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   ci:
@@ -31,10 +35,16 @@ jobs:
     name: Deploy to Azure Functions (opcional)
     runs-on: ubuntu-latest
     needs: ci
-    # Gated: só roda em push na main COM a variável DEPLOY_ENABLED=true.
+    # Gated: push na main ou disparo manual, e só com a variável DEPLOY_ENABLED=true.
     # Assim a CI (build+test) permanece verde sem os secrets Azure (RT5) — antes
-    # a CD rodava sempre e quebrava no Azure Login por falta de AZURE_CREDENTIALS.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    # a CD rodava sempre e quebrava no Azure Login por falta de credenciais.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+      && vars.DEPLOY_ENABLED == 'true'
+    permissions:
+      id-token: write # obrigatório para o OIDC do azure/login
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -43,18 +53,35 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Azure Login
+      # Autenticação federada (OIDC): nenhuma senha de longa duração fica guardada no repositório.
+      - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       # Este serviço é uma Azure Function (.NET 8 isolated), NÃO um container/AKS/ACA.
       # Publica direto na Function App gerenciada via azure/functions-action.
       - name: Publish Function
         run: dotnet publish src/HackatonFiap.Notifications/HackatonFiap.Notifications.csproj -c Release -o ./output
 
+      # O plano é Flex Consumption (FC1) — o `sku` precisa ser explícito para a action
+      # usar a API OneDeploy em vez do zipdeploy clássico.
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
         with:
-          app-name: func-conexao-notifications-7xafxr
+          app-name: ${{ secrets.FUNCTION_APP_NAME }}
           package: ./output
+          sku: flexconsumption
+
+      - name: Confirma o estado da Function App
+        run: |
+          az functionapp show \
+            -g ${{ secrets.RESOURCE_GROUP }} \
+            -n ${{ secrets.FUNCTION_APP_NAME }} \
+            --query "{state:properties.state,sku:properties.sku}" -o json
+          az functionapp function list \
+            -g ${{ secrets.RESOURCE_GROUP }} \
+            -n ${{ secrets.FUNCTION_APP_NAME }} \
+            --query "[].{name:name,disabled:isDisabled}" -o json
