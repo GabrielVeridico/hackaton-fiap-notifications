@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# Enfileira os runs em vez de deixar dois deploys concorrentes disputarem o mesmo
+# Function App. cancel-in-progress fica false: abortar no meio de um rollout
+# deixaria o recurso em estado indeterminado.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   ci:
     name: Build & Test
@@ -75,13 +82,35 @@ jobs:
           package: ./output
           sku: flexconsumption
 
-      - name: Confirma o estado da Function App
+      # Passo de gate, não decorativo: a functions-action pode retornar sucesso e a função
+      # não subir (pacote inválido, host em crash-loop). Aqui exigimos que o app esteja
+      # Running e que pelo menos uma function esteja registrada, senão o job falha.
+      - name: Confirma que a Function subiu
         run: |
-          az functionapp show \
-            -g ${{ secrets.RESOURCE_GROUP }} \
-            -n ${{ secrets.FUNCTION_APP_NAME }} \
-            --query "{state:properties.state,sku:properties.sku}" -o json
-          az functionapp function list \
-            -g ${{ secrets.RESOURCE_GROUP }} \
-            -n ${{ secrets.FUNCTION_APP_NAME }} \
-            --query "[].{name:name,disabled:isDisabled}" -o json
+          set -euo pipefail
+          RG='${{ secrets.RESOURCE_GROUP }}'
+          APP='${{ secrets.FUNCTION_APP_NAME }}'
+
+          # Dependendo da versão da az CLI o show devolve o shape ARM cru ou o achatado.
+          ESTADO=$(az functionapp show -g "$RG" -n "$APP" --query "properties.state" -o tsv)
+          [ -n "$ESTADO" ] && [ "$ESTADO" != "null" ] || \
+            ESTADO=$(az functionapp show -g "$RG" -n "$APP" --query "state" -o tsv)
+          echo "Function App: $ESTADO"
+          if [ "$ESTADO" != "Running" ]; then
+            echo "::error::Function App em estado '$ESTADO', esperado Running"
+            exit 1
+          fi
+
+          # O host só lista as functions depois de recarregar o pacote novo.
+          for tentativa in $(seq 1 20); do
+            QTD=$(az functionapp function list -g "$RG" -n "$APP" --query "length(@)" -o tsv 2>/dev/null || echo 0)
+            echo "  [$tentativa/20] functions registradas: $QTD"
+            if [ "${QTD:-0}" -gt 0 ]; then
+              az functionapp function list -g "$RG" -n "$APP" \
+                --query "[].{nome:name,desabilitada:isDisabled}" -o table
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::nenhuma function registrada 5min após o deploy"
+          exit 1
